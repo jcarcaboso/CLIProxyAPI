@@ -323,8 +323,12 @@ func newCodexStatusErrWithCooling(statusCode int, body []byte, modelLevelCooling
 	}
 	body = classifyCodexStatusError(errCode, body)
 	err := statusErr{code: errCode, msg: string(body), credentialScoped: credentialScoped}
-	if retryAfter := parseCodexRetryAfter(errCode, body, time.Now()); retryAfter != nil {
+	now := time.Now()
+	if retryAfter := parseCodexRetryAfter(errCode, body, now); retryAfter != nil {
 		err.retryAfter = retryAfter
+		if *retryAfter > 0 {
+			err.retryAt = now.Add(*retryAfter)
+		}
 	}
 	return err
 }

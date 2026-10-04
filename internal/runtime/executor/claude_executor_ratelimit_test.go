@@ -12,16 +12,111 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
+	claudehandlers "github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers/claude"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
+	"github.com/tidwall/gjson"
 )
 
 type retryAfterProvider interface {
 	RetryAfter() *time.Duration
+}
+
+func TestClaudeUpstreamDeadlineReachesClientErrorMessage(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	future := time.Now().Add(time.Hour).Unix()
+	headers := http.Header{
+		"Anthropic-Ratelimit-Unified-Status":    []string{"rejected"},
+		"Anthropic-Ratelimit-Unified-5h-Status": []string{"rejected"},
+		"Anthropic-Ratelimit-Unified-5h-Reset":  []string{strconv.FormatInt(future, 10)},
+	}
+	handler := claudehandlers.NewClaudeCodeAPIHandler(&handlers.BaseAPIHandler{})
+	err := classifyClaudeUpstreamError(http.StatusTooManyRequests, headers,
+		[]byte(`{"error":{"type":"rate_limit_error","message":"Session limit reached"}}`))
+	deadline := err.(interface{ RetryAt() time.Time }).RetryAt()
+	if deadline.Unix() < future {
+		t.Fatal("deadline precedes the rejected window reset")
+	}
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	handler.WriteErrorResponse(ctx, &interfaces.ErrorMessage{
+		StatusCode: http.StatusTooManyRequests,
+		Error:      err,
+	})
+	message := gjson.Get(recorder.Body.String(), "error.message").String()
+	reset := deadline.Unix()
+	if deadline.Nanosecond() > 0 {
+		reset++
+	}
+	if !strings.HasSuffix(message, " [CLIProxyAPI retry_at="+strconv.FormatInt(reset, 10)+"]") {
+		t.Fatalf("upstream deadline was lost: %s", recorder.Body.String())
+	}
+	for _, failure := range []struct {
+		headers http.Header
+		body    string
+	}{
+		{nil, `{"error":{"type":"rate_limit_error","message":"unknown limit"}}`},
+		{http.Header{"Retry-After": []string{"3600"}},
+			`{"error":{"type":"rate_limit_error","message":"Usage credits are required for fast mode"}}`},
+	} {
+		err := classifyClaudeUpstreamError(http.StatusTooManyRequests, failure.headers, []byte(failure.body))
+		if !err.(interface{ RetryAt() time.Time }).RetryAt().IsZero() {
+			t.Fatalf("non-recoverable refusal acquired deadline: %s", failure.body)
+		}
+	}
+}
+
+func TestOtherBackendDeadlinesReachClaudeClientsWithoutGuessing(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	codex := newCodexStatusErr(http.StatusTooManyRequests,
+		[]byte(`{"error":{"type":"usage_limit_reached","resets_in_seconds":3600}}`))
+	websocket, ok := parseCodexWebsocketError(
+		[]byte(`{"type":"error","status":429,"error":{"type":"usage_limit_reached","resets_in_seconds":3600}}`))
+	if !ok {
+		t.Fatal("Codex websocket reset error was not classified")
+	}
+	openAI := newOpenAICompatStatusError(http.StatusTooManyRequests,
+		http.Header{"Retry-After": []string{"3600"}}, []byte(`{"error":{"message":"rate limit"}}`))
+	handler := claudehandlers.NewClaudeCodeAPIHandler(&handlers.BaseAPIHandler{})
+	for _, err := range []error{codex, websocket, openAI} {
+		deadline := err.(interface{ RetryAt() time.Time }).RetryAt()
+		if deadline.IsZero() {
+			t.Fatalf("known backend deadline was lost: %T", err)
+		}
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		handler.WriteErrorResponse(ctx, &interfaces.ErrorMessage{
+			StatusCode: http.StatusTooManyRequests,
+			Error:      err,
+		})
+		if !strings.Contains(gjson.Get(recorder.Body.String(), "error.message").String(), "[CLIProxyAPI retry_at=") {
+			t.Fatalf("backend deadline did not reach Claude client: %T", err)
+		}
+	}
+	for _, err := range []statusErr{
+		newCodexStatusErr(http.StatusTooManyRequests, []byte(`{"error":{"type":"usage_limit_reached"}}`)),
+		newOpenAICompatStatusError(http.StatusTooManyRequests, nil,
+			[]byte(`{"error":{"message":"Rate limit reached on tokens per min (TPM)"}}`)),
+	} {
+		if !err.RetryAt().IsZero() {
+			t.Fatal("unknown reset or heuristic fallback acquired a reported deadline")
+		}
+	}
+	for _, raw := range []string{"", "malformed", "-1", "9223372036854775807"} {
+		err := newOpenAICompatStatusError(http.StatusTooManyRequests,
+			http.Header{"Retry-After": []string{raw}},
+			[]byte(`{"error":{"code":"ModelAccountTpmRateLimitExceeded","message":"TPM limit exceeded"}}`))
+		if !err.RetryAt().IsZero() {
+			t.Fatalf("invalid retry header was promoted into a deadline: %q", raw)
+		}
+	}
 }
 
 func TestClaudeExecutor_HonorsAnthropicRateLimitHeaders_Execute(t *testing.T) {
@@ -71,6 +166,13 @@ func TestClaudeExecutor_HonorsAnthropicRateLimitHeaders_Execute(t *testing.T) {
 	retryAfter := rap.RetryAfter()
 	if retryAfter == nil {
 		t.Fatalf("expected non-nil RetryAfter, got nil")
+	}
+	var deadline interface{ RetryAt() time.Time }
+	if !errors.As(err, &deadline) || deadline.RetryAt().IsZero() {
+		t.Fatal("upstream reset deadline was lost before the client error response")
+	}
+	if first, second := deadline.RetryAt(), deadline.RetryAt(); first != second {
+		t.Fatal("reset deadline changed between reads")
 	}
 
 	// Should be at least 7 days (reported reset) and at most 7 days + 35s (fuzz upper bound).

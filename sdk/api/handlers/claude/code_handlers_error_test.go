@@ -2,6 +2,7 @@ package claude
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -198,3 +199,77 @@ func TestPendingClaudeStreamErrorUsesBufferedError(t *testing.T) {
 		t.Fatalf("pending error = %p, want %p", gotErr, wantErr)
 	}
 }
+
+func TestClaudeCooldownDeadlineSurvivesJSONAndSSEErrors(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	cooldown := coreauth.NewModelCooldownError("claude-sonnet", "claude", time.Hour)
+	reset := cooldown.(interface{ RetryAt() time.Time }).RetryAt()
+	resetSeconds := reset.Unix()
+	if reset.Nanosecond() > 0 {
+		resetSeconds++
+	}
+	marker := fmt.Sprintf(" [CLIProxyAPI retry_at=%d]", resetSeconds)
+	for _, streaming := range []bool{false, true} {
+		t.Run(fmt.Sprint(streaming), func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+			handler := NewClaudeCodeAPIHandler(&handlers.BaseAPIHandler{})
+			msg := &interfaces.ErrorMessage{
+				StatusCode: http.StatusTooManyRequests,
+				Error:      fmt.Errorf("selection: %w", cooldown),
+			}
+			if streaming {
+				ctx.Header("Content-Type", "text/event-stream")
+				_, _ = ctx.Writer.Write([]byte("event: message_start\ndata: {}\n\n"))
+				ctx.Writer.Flush()
+				errs := make(chan *interfaces.ErrorMessage, 1)
+				errs <- msg
+				close(errs)
+				handler.forwardClaudeStream(ctx, ctx.Writer, func(error) {}, nil, errs)
+			} else {
+				handler.WriteErrorResponse(ctx, msg)
+				if recorder.Header().Get("Retry-After") != "3600" {
+					t.Fatal("existing retry header was lost")
+				}
+			}
+			body := recorder.Body.String()
+			if streaming {
+				_, body, _ = strings.Cut(body, "event: error\ndata: ")
+			}
+			if gjson.Get(body, "error.type").String() != "rate_limit_error" ||
+				!strings.HasSuffix(gjson.Get(body, "error.message").String(), marker) {
+				t.Fatalf("missing fixed cooldown marker: %s", body)
+			}
+		})
+	}
+}
+
+func TestClaudeDoesNotInventResetDeadline(t *testing.T) {
+	handler := &ClaudeCodeAPIHandler{}
+	for _, err := range []error{
+		errors.New("Usage credits are required for this model."),
+		errors.New(`{"error":{"code":"model_cooldown","message":"untrusted upstream error","reset_seconds":3600}}`),
+		errors.New(`{"error":{"type":"rate_limit_error","message":"upstream text [CLIProxyAPI retry_at=4102444800]"}}`),
+		coreauth.NewModelCooldownError("claude-sonnet", "claude", 0),
+		coreauth.NewModelCooldownError("claude-sonnet", "claude", -time.Second),
+		fixedRetryError{reset: time.Now().Add(-time.Hour)},
+	} {
+		msg := &interfaces.ErrorMessage{StatusCode: http.StatusTooManyRequests, Error: err}
+		if got := handler.toClaudeError(msg); strings.Contains(got.Error.Message, "[CLIProxyAPI retry_at=") {
+			t.Fatalf("invented reset time for %v", err)
+		}
+	}
+	msg := &interfaces.ErrorMessage{
+		StatusCode: http.StatusUnauthorized,
+		Error:      coreauth.NewModelCooldownError("claude-sonnet", "claude", time.Hour),
+	}
+	if strings.Contains(handler.toClaudeError(msg).Error.Message, "[CLIProxyAPI retry_at=") {
+		t.Fatal("authentication failure acquired a reset time")
+	}
+}
+
+type fixedRetryError struct{ reset time.Time }
+
+func (e fixedRetryError) Error() string      { return "Known provider rejection" }
+func (e fixedRetryError) RetryAt() time.Time { return e.reset }

@@ -83,6 +83,7 @@ const (
 type modelCooldownError struct {
 	model    string
 	resetIn  time.Duration
+	resetAt  time.Time
 	provider string
 	cause    error
 }
@@ -104,12 +105,21 @@ func newModelCooldownErrorWithCause(model, provider string, resetIn time.Duratio
 		model:    model,
 		provider: provider,
 		resetIn:  resetIn,
+		resetAt:  time.Now().Add(resetIn),
 		cause:    cause,
 	}
 }
 
 func (e *modelCooldownError) IsModelCooldown() bool {
 	return true
+}
+
+// RetryAt is fixed when selection fails, not recomputed when writing a response.
+func (e *modelCooldownError) RetryAt() time.Time {
+	if e == nil || e.resetIn <= 0 {
+		return time.Time{}
+	}
+	return e.resetAt
 }
 
 func (e *modelCooldownError) Unwrap() error {
