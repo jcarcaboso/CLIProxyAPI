@@ -11,9 +11,11 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -335,6 +337,8 @@ type claudeErrorResponse struct {
 	Error claudeErrorDetail `json:"error"`
 }
 
+var claudeRetryMarker = regexp.MustCompile(`(?: \[CLIProxyAPI retry_at=[0-9]+\])+$`)
+
 func (h *ClaudeCodeAPIHandler) toClaudeError(msg *interfaces.ErrorMessage) claudeErrorResponse {
 	status := http.StatusInternalServerError
 	errText := http.StatusText(status)
@@ -350,6 +354,27 @@ func (h *ClaudeCodeAPIHandler) toClaudeError(msg *interfaces.ErrorMessage) claud
 		}
 	}
 	errType, message := claudeErrorDetailFromText(status, errText)
+	// This suffix belongs to the proxy, not arbitrary upstream error text.
+	message = claudeRetryMarker.ReplaceAllString(message, "")
+	if status == http.StatusTooManyRequests && msg != nil {
+		var cooldown interface {
+			error
+			RetryAt() time.Time
+		}
+		if errors.As(msg.Error, &cooldown) {
+			reset := cooldown.RetryAt()
+			if !reset.IsZero() && reset.After(time.Now()) {
+				// Claude drops extension fields and headers for custom endpoints.
+				// Managed launchers recover this proxy-owned deadline from the
+				// error message. Round upward to avoid an early retry.
+				resetSeconds := reset.Unix()
+				if reset.Nanosecond() > 0 {
+					resetSeconds++
+				}
+				message += fmt.Sprintf(" [CLIProxyAPI retry_at=%d]", resetSeconds)
+			}
+		}
+	}
 	return claudeErrorResponse{
 		Type: "error",
 		Error: claudeErrorDetail{

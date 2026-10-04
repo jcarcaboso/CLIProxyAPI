@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"mime"
 	"mime/multipart"
 	"net/http"
@@ -1067,6 +1068,7 @@ type statusErr struct {
 	code             int
 	msg              string
 	retryAfter       *time.Duration
+	retryAt          time.Time
 	credentialScoped bool
 }
 
@@ -1078,16 +1080,29 @@ func (e statusErr) Error() string {
 }
 func (e statusErr) StatusCode() int            { return e.code }
 func (e statusErr) RetryAfter() *time.Duration { return e.retryAfter }
+func (e statusErr) RetryAt() time.Time         { return e.retryAt }
 func (e statusErr) IsCredentialScoped() bool   { return e.credentialScoped }
 
 const openAICompatTPMFallbackRetryAfter = time.Minute
 
 func newOpenAICompatStatusError(status int, headers http.Header, body []byte) statusErr {
-	return statusErr{
+	now := time.Now()
+	err := statusErr{
 		code:       status,
 		msg:        string(body),
-		retryAfter: openAICompatRetryAfter(status, headers, body, time.Now()),
+		retryAfter: openAICompatRetryAfter(status, headers, body, now),
 	}
+	// Do not promote the executor's heuristic TPM fallback into a reported reset.
+	raw := strings.TrimSpace(headers.Get("Retry-After"))
+	if raw != "" && err.retryAfter != nil && *err.retryAfter > 0 {
+		if seconds, parseErr := strconv.ParseInt(raw, 10, 64); parseErr == nil &&
+			seconds > 0 && seconds <= math.MaxInt64/int64(time.Second) {
+			err.retryAt = now.Add(time.Duration(seconds) * time.Second)
+		} else if deadline, parseErr := http.ParseTime(raw); parseErr == nil && deadline.After(now) {
+			err.retryAt = deadline
+		}
+	}
+	return err
 }
 
 // openAICompatRetryAfter preserves the provider's standard Retry-After signal.

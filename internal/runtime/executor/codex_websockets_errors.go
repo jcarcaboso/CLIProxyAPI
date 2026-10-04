@@ -53,8 +53,12 @@ func parseCodexWebsocketErrorWithCooling(payload []byte, modelLevelCooling bool)
 		msg:              string(out),
 		credentialScoped: isUsageLimit && !modelLevelCooling,
 	}
-	if retryAfter := parseCodexRetryAfter(status, out, time.Now()); retryAfter != nil {
+	now := time.Now()
+	if retryAfter := parseCodexRetryAfter(status, out, now); retryAfter != nil {
 		statusError.retryAfter = retryAfter
+		if *retryAfter > 0 {
+			statusError.retryAt = now.Add(*retryAfter)
+		}
 	} else if isCodexWebsocketConnectionLimitError(payload) {
 		retryAfter := time.Duration(0)
 		statusError.retryAfter = &retryAfter
